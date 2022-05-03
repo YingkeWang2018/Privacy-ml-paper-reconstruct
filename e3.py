@@ -4,61 +4,152 @@ import matplotlib.pyplot as plt
 from tensorflow.python.keras.metrics import Metric
 import copy
 import os
-
+from scipy.spatial import distance
 import numpy as np
 import dill
+from numpy.linalg import svd
+import time
+NUM_BUCKET = 10
+NUM_MEAN_ITER = 30
+
 
 def add_gradient_noise(t, noise_multiplier, clip, stddev=1.0, name="add_gradient_noise"):
     """Adds gradient noise as described in http://arxiv.org/abs/1511.06807 [2].
 
     The input Tensor `t` should be a gradient.
 
-    The output will be `t` + gaussian noise.""" 
+    The output will be `t` + gaussian noise."""
 
     t = t[0]
     for i in range(len(t)):
-        noise = tf.random.normal(shape=tf.shape(t[i]), mean=0.0, stddev=stddev * noise_multiplier * clip, dtype=tf.float32)
+        noise = tf.random.normal(shape=tf.shape(t[i]), mean=0.0, stddev=stddev * noise_multiplier * clip,
+                                 dtype=tf.float32)
         t[i] += noise
     return t
 
+
 def perform_top_k(grad, percentile):
-    population = np.abs(np.concatenate([ np.reshape(w0, (-1, )) for w0 in grad]))
+    population = np.abs(np.concatenate([np.reshape(w0, (-1,)) for w0 in grad]))
     population_size = len(population)
     k = int(population_size * percentile)
     ind = np.argpartition(population, -k)[-k:]
     threshold = np.min(population[ind])
     if percentile == 0 or k == 0:
         threshold = np.inf
-    
+
     for i in range(len(grad)):
         np_arr = grad[i].numpy()
         np_arr[(np_arr < threshold) & (np_arr > -threshold)] = 0.0
         grad[i] = tf.convert_to_tensor(np_arr)
     return grad
 
+
 def eval_top_k_indices(grad, nc_grad, percentile):
     grad = perform_top_k(grad, percentile)
     # nc_grad = perform_top_k(nc_grad, percentile)
-    population = np.abs(np.concatenate([ np.reshape(w0, (-1, )) for w0 in grad]))
+    population = np.abs(np.concatenate([np.reshape(w0, (-1,)) for w0 in grad]))
     population_size = len(population)
-    
-    grad = np.concatenate([ np.reshape(w0, (-1, )) for w0 in grad])
-    nc_grad = np.concatenate([ np.reshape(w0, (-1, )) for w0 in nc_grad])
-    
+
+    grad = np.concatenate([np.reshape(w0, (-1,)) for w0 in grad])
+    nc_grad = np.concatenate([np.reshape(w0, (-1,)) for w0 in nc_grad])
+
     zero_grad = np.count_nonzero(grad == 0.0)
-    
-    grad[nc_grad == 0.0] = 0 
-    
+
+    grad[nc_grad == 0.0] = 0
+
     new_zero_grad = np.count_nonzero(grad == 0.0)
     return (new_zero_grad - zero_grad) / (population_size * percentile)
 
+
+def convert_gradients_np(grad_lst):
+    result = []
+    for grad in grad_lst:
+        grad_np = []
+        for i in range(len(grad)):
+            np_arr = list(grad[i])
+            grad_np.append(np_arr)
+        result.append(grad_np)
+    return result
+
+
 def random_sample_buckets(gradient_lst, num_bucket):
-    result_lst = [[] * num_bucket]
+    """split the gradients into sub buckets"""
+    result_lst = [[] for _ in range(num_bucket)]
     for gradient in gradient_lst:
-        np.random.randint(())
+        bucket_indx = np.random.randint(num_bucket)
+        result_lst[bucket_indx].append(gradient)
+    return result_lst
 
 
-    
+def calculate_median_of_means(gradient_lst):
+    """get the initial estimate using median of means """
+    means = []
+    for gradient_sub in gradient_lst:
+        means.append(np.mean(gradient_sub, axis=0))
+
+    return means, np.median(means, axis=0)
+
+
+def reshape_grad_lst(gradient_lst):
+    """reshape the gradient_lst to return a list of samples of each individual gradient"""
+    gradients_in_model = len(gradient_lst[0])
+    gradients_lst = [[] for _ in range(gradients_in_model)]
+    for sample_gradient in gradient_lst:
+        for i in range(len(sample_gradient)):
+            gradients_lst[i].append(sample_gradient[i])
+    return gradients_lst
+
+def paper_mean_alg(gradient_lst):
+    sample_gradients_lst = reshape_grad_lst(gradient_lst)
+    papaer_mean = []
+    for gradient_lst in sample_gradients_lst:
+        bucket_gradients = random_sample_buckets(gradient_lst, NUM_BUCKET)
+        bucket_means, x_0 = calculate_median_of_means(bucket_gradients)
+        bucket_means = pruning_scaling(bucket_means, x_0)
+        # get optimal theta
+        lower_theta = 0
+        higher_theta = 1
+        # approxBregman(bucket_means, (higher_theta + lower_theta)/2, NUM_MEAN_ITER)
+        papaer_mean.append(x_0)
+    return papaer_mean
+
+
+
+def pruning_scaling(bucket_means, x_0):
+    """preprocessing step"""
+    # pruning part
+    dsts =[]
+    for bucket_mean in bucket_means:
+        dsts.append((bucket_mean, distance.euclidean(bucket_mean.flatten(), x_0.flatten())))
+    dsts.sort(reverse=True, key=lambda tup: tup[1])
+    dsts_reduce = dsts[round(len(bucket_means)/10):]
+    max_edu = dsts_reduce[0][1]
+    dsts_reduce = [item[0] for item in dsts_reduce]
+
+    return np.array([1/max_edu *(dst - x_0) for dst in dsts_reduce])
+
+def get_optimal_theta():
+    """Distance estimate function"""
+
+    pass
+
+
+def approxBregman(bucket_means, theta, num_iterations):
+    """approxBergman algorithm"""
+    initial_weight = np.ones(len(bucket_means)) * 1/len(bucket_means)
+    for t in range(num_iterations):
+        A_t = []
+        for i in range(bucket_means):
+            A_t.append(np.sqrt(initial_weight[i]) * bucket_means[i])
+            A_t = np.array(A_t)
+            U,S,VT = svd(A_t, full_matrices=False)
+            w_t = VT[0]
+            w_t = w_t.reshape((-1, 1))
+            sigma = np.abs(bucket_means @ w_t)
+
+
+
+
 
 if __name__ == '__main__':
     seed = 1234
@@ -103,10 +194,10 @@ if __name__ == '__main__':
     learning_rate = 0.01
     noise_multiplier = 0.03 # 0.01
     percentile = 0.01
-    num_microbatch = 256
+    num_microbatch = 500
 
     assert len(train_data) % num_microbatch == 0
-    assert epochs * (5000 / num_microbatch) == 1000 # Only want 1000 updates, 5000 is training data length
+    # assert epochs * (5000 / num_microbatch) == 1000 # Only want 1000 updates, 5000 is training data length
 
     thres1 = 1
     thres2 = 5
@@ -155,20 +246,22 @@ if __name__ == '__main__':
 
             del tape
 
-            true_mean = np.mean(grad_arr, axis=0)
-                
             for i in range(len(grad_arr)):
                 grad_arr[i] = tf.clip_by_global_norm(grad_arr[i], l2_norm_clip)
                 grad_arr[i] = add_gradient_noise(grad_arr[i], noise_multiplier, l2_norm_clip, std_dev)
 
-
+            # standard mean
+            start_time = time.time()
+            mean_ = np.mean(grad_arr, axis=0)
+            # mean_ = paper_mean_alg(grad_arr)
+            print(f'meam Alg duration {time.time() - start_time}')
             # selected_grad = []
             # selected_grad = np.mean(grad_arr, axis=0)
-            grad_com = perform_top_k(true_mean, percentile)
+            grad_com = perform_top_k(mean_, percentile)
             optimizer.apply_gradients(zip(grad_com, model.trainable_variables))
         
 
-    filename = "TRUEMEANp=" + str(percentile) + ",n=" + str(noise_multiplier) + ",c=" + str(l2_norm_clip) + "_seed=" + str(seed) + "_batch=" + str(num_microbatch) + "standard_acc"
+    filename = "p=" + str(percentile) + ",n=" + str(noise_multiplier) + ",c=" + str(l2_norm_clip) + "_seed=" + str(seed) + "_batch=" + str(num_microbatch) + "paper_acc"
 
     with open(filename, "wb") as dill_file:
         dill.dump(acc_arr, dill_file)
